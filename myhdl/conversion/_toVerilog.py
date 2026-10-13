@@ -29,6 +29,7 @@ import inspect
 import time
 import ast
 import string
+from copy import copy
 from io import StringIO
 
 from types import GeneratorType
@@ -689,6 +690,8 @@ class _ConvertVisitor(ast.NodeVisitor, _ConversionMixin):
             self.visit(node.left)
             self.write(", ")
             self.visit(node.right)
+        elif node.signed and isinstance(node.op, (ast.FloorDiv, ast.Mod)):
+            self.writeSignedDivMod(node.left, node.op, node.right)
         else:
             if isinstance(node.op, ast.RShift):
                 # Additional cast to signed of the full expression
@@ -706,6 +709,31 @@ class _ConvertVisitor(ast.NodeVisitor, _ConversionMixin):
             self.visit(node.right)
             self.write(")")
             self.context = None
+
+    def writeSignedDivMod(self, left, op, right):
+        # Render once, as visiting an operand can modify its AST.
+        operands = []
+        buf = self.buf
+        try:
+            for node in (left, right):
+                self.buf = StringIO()
+                self.context = _context.SIGNED
+                self.visit(node)
+                operands.append(self.buf.getvalue())
+        finally:
+            self.buf = buf
+            self.context = None
+        left, right = operands
+        remainder = "(%s %% %s)" % (left, right)
+        # HDL division truncates; Python rounds down for opposite signs.
+        correction = "((%s < 0) != (%s < 0)) && (%s != 0)" % \
+                     (left, right, remainder)
+        if isinstance(op, ast.FloorDiv):
+            self.write("((%s / %s) - (%s ? 1 : 0))" %
+                       (left, right, correction))
+        else:
+            self.write("(%s ? (%s + %s) : %s)" %
+                       (correction, remainder, right, remainder))
 
     def checkOpWithNegIntbv(self, node, op):
         if op in ("+", "-", "*", "~", "&&", "||", "!"):
@@ -828,6 +856,18 @@ class _ConvertVisitor(ast.NodeVisitor, _ConversionMixin):
         self.write(';')
 
     def visit_AugAssign(self, node, *args):
+        # Use a load context when the target is also an arithmetic operand.
+        if isinstance(node.op, (ast.FloorDiv, ast.Mod)):
+            left = copy(node.target)
+            left.ctx = ast.Load()
+            left.signed = _maybeNegative(left.obj)
+            expr = ast.BinOp(left=left, op=node.op, right=node.value)
+            expr.signed = left.signed or node.value.signed
+            self.visit(node.target)
+            self.write(" = ")
+            self.visit_BinOp(expr)
+            self.write(";")
+            return
         # XXX apparently no signed context required for augmented assigns
         self.visit(node.target)
         self.write(" = ")

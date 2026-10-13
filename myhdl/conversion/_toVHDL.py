@@ -853,10 +853,34 @@ class _ConvertVisitor(ast.NodeVisitor, _ConversionMixin):
     def BinOp(self, node):
         pre, suf = self.inferBinaryOpCast(node, node.left, node.right, node.op)
         self.write(pre)
-        self.visit(node.left)
-        self.write(" %s " % opmap[type(node.op)])
-        self.visit(node.right)
+        if isinstance(node.op, ast.FloorDiv) and maybeNegative(node.vhdOri):
+            self.writeFloorDiv(node.left, node.right, node.vhdOri)
+        else:
+            self.visit(node.left)
+            self.write(" %s " % opmap[type(node.op)])
+            self.visit(node.right)
         self.write(suf)
+
+    def writeFloorDiv(self, left, right, vhd):
+        # Render once, as visiting an operand can modify its AST.
+        operands = []
+        buf = self.buf
+        try:
+            for node in (left, right):
+                self.buf = StringIO()
+                self.visit(node)
+                operands.append(self.buf.getvalue())
+        finally:
+            self.buf = buf
+        left, right = operands
+        # A nonzero remainder with opposite operand signs needs rounding down.
+        correction = "((%s < 0) xor (%s < 0)) and (%s rem %s /= 0)" % \
+                     (left, right, left, right)
+        if isinstance(vhd, vhd_signed):
+            correction = "to_signed(%s, %s)" % (correction, vhd.size)
+        else:
+            correction = "to_integer(%s)" % correction
+        self.write("(%s / %s - %s)" % (left, right, correction))
 
     def inferShiftOpCast(self, node, left, right, op):
         ns, os = node.vhd.size, node.vhdOri.size
@@ -1083,6 +1107,11 @@ class _ConvertVisitor(ast.NodeVisitor, _ConversionMixin):
         self.visit(left)
         self.write(" := ")
         self.write(pre)
+        if isinstance(op, ast.FloorDiv) and maybeNegative(node.vhdOri):
+            self.writeFloorDiv(left, right, node.vhdOri)
+            self.write(suf)
+            self.write(";")
+            return
         if isFunc:
             self.write("%s(" % opmap[type(op)])
         self.visit(left)
